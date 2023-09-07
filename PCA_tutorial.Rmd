@@ -1,0 +1,178 @@
+---
+title: "PCA Exercise using bedpca"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+This exercise generally follows the vignette by Florian Privé available online [**here**](https://privefl.github.io/bigsnpr/articles/bedpca.html).
+
+The most relevant literature is [Privé *et al.*, Bioinformatics 2020](https://doi.org/10.1093/bioinformatics/btaa520). And a draft manual for `bigstatr` and `bigsnpr` can be found [here](https://privefl.github.io/bigsnpr-extdoc/introduction.html). 
+
+## Prerequisites (IMPORTANT)
+
+There are several requirements for completing this exercise.
+
+1.  R studio with R version \>3.3.
+2.  R packages bigsnpr (and bigstatsr). For most users executing the `install.packages("bigsnpr")` ensures this.
+
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/Users/au507860/Downloads')
+```
+
+First we load the bigsnpr package.
+
+```{r}
+library(bigsnpr)
+library(R.utils)
+
+#For plotting
+library(ggplot2) 
+library(viridis)
+
+#Other
+library(runonce)
+
+```
+
+### 1 Principal Component Analysis (PCA) and Relateness
+
+A vignette for how to conduct PCA analyses using the package can be found [**here**](https://privefl.github.io/bigsnpr/articles/bedpca.html).
+
+First we download the 1000 genomes data in plink bed file format, which can take time if the internet connection is slow.
+
+```{r}
+bedfile <- download_1000G("data")
+```
+##### Q1: What are plink bed files?
+
+#### Relateness
+
+First, let us detect all pairs of related individuals by filtering on the kinship coefficient. Note that the kinship coefficient is the probability that a pair of randomly sampled homologous alleles are identical by descent (IBD). It's half of the corresponding GRM value, also known as the coefficient of relatedness.
+
+
+```{r}
+plink2 <- download_plink2("data")
+rel <- snp_plinkKINGQC(
+  plink2.path = plink2,
+  bedfile.in = bedfile,
+  thr.king = 2^-4.5,
+  make.bed = FALSE,
+  ncores = nb_cores()
+)
+str(rel)
+```
+
+##### Q2: What threshold was used to filter related individuals? What level of relatedness does it correspond to?
+##### Q3: How many individuals were removed
+
+##### Q4: Can you plot the kinship values, also using a less stringent threshold?
+
+
+#### Principal Component Analysis (PCA)
+
+We then prune related individuals and compute PCA on the remaining (unrelated) individuals. The function `bed_autoSVD()` iteratively prunes variants to reduce the risk of the PCA capturing Linkage Disequilibrium (LD).
+
+```{r}
+(obj.bed <- bed(bedfile))
+ind.rel <- match(c(rel$IID1, rel$IID2), obj.bed$fam$sample.ID)
+ind.norel <- rows_along(obj.bed)[-ind.rel]
+
+obj.svd <- bed_autoSVD(obj.bed, ind.row = ind.norel, k = 20,
+                       ncores = nb_cores())
+```
+
+##### Q5: What did we do with the related individuals?
+
+##### Q6: What other parameters does bed_autoSVD accept?
+
+##### Q7: How many PCs do we estimate?
+
+
+We can plot these PCs.
+
+```{r}
+anc_info <- read.delim('data/1000G_phase3_common_norel.fam2')[-ind.rel,]
+
+plot_grid(plotlist = lapply(1:4, function(k) {
+  plot(obj.svd, type = "scores", scores = 2 * k - 1:0, coeff = 0.6) +
+  aes(color=anc_info$Super.Population) +
+  scale_color_viridis(name="Ancestry", discrete = TRUE)
+}), scale = 0.95)
+```
+
+##### Q8: Which PC explains most genetic variation?
+
+##### Q9: Can you describe what these PCs 3-8 are capturing?
+
+##### Q10: Can you plot the 20 PCs?  
+
+
+#### Outlier sample detection (quality control)
+
+Then, we look at if there are individual outliers, that could be evidence for genotyping issues.
+
+```{r}
+prob <- bigutilsr::prob_dist(obj.svd$u, ncores = nb_cores())
+S <- prob$dist.self / sqrt(prob$dist.nn)
+
+```
+
+We can then rerun the PCA without these outliers
+
+```{r}
+ind.row <- ind.norel[S < 0.5]
+ind.col <- attr(obj.svd, "subset")
+obj.svd2 <- bed_autoSVD(obj.bed, ind.row = ind.row,
+                        ind.col = ind.col, thr.r2 = NA,
+                        k = 20, ncores = nb_cores())
+```
+
+##### Q11: How many individuals were removed?  
+##### Q12: What are we filtering on? (may have to read the paper to answer this) 
+
+
+#### Final PCA with all individuals
+
+We would still like to obtain the PCA values for the remaining individuals. We do this by projecting the excluded individuals onto the newly derived PCs, to get PCs for all inviduals.
+
+```{r}
+PCs <- matrix(NA, nrow(obj.bed), ncol(obj.svd2$u))
+PCs[ind.row, ] <- predict(obj.svd2)
+
+proj <- bed_projectSelfPCA(obj.svd2, obj.bed,
+                           ind.row = rows_along(obj.bed)[-ind.row],
+                           ncores = 1) # useless -> too few individuals
+PCs[-ind.row, ] <- proj$OADP_proj
+```
+
+##### Q13: How do we project individuals onto a PC space?  (might have to read paper or do math)
+
+We can plot the PCs again.
+
+```{r}
+anc_info <- read.delim('data/1000G_phase3_common_norel.fam2')
+PCs_df <- as.data.frame(PCs)
+colnames(PCs_df) <- paste("PC",1:20,sep="")
+
+ggplot(data = PCs_df, mapping = aes(x = PC1, y = PC2)) +
+    scale_color_viridis(name="Ancestry", discrete = TRUE)+
+    geom_point(aes(color = anc_info$Super.Population))
+
+ggplot(data = PCs_df, mapping = aes(x = PC3, y = PC4)) +
+    scale_color_viridis(name="Ancestry", discrete = TRUE)+
+    geom_point(aes(color = anc_info$Super.Population))
+
+```
+
+##### Q14: Did the PCs 1-8 change?  Why or why not?
+
+
+#### Restricting to a specific ancestry
+
+We want the set of individuals in our LD reference to have similar ancestry as the ones in our summary statistics. E.g. if we want to use summary statistics based on individuals with East Asian ancestry, we should exclude individuals that have a different ancestry in our LD reference. If labels are available we can use these. If not, then we can project the LD reference data on to 1KG and exclude individuals that land far away from individuals with the target ancestry. You can use functions `cov <- bigutilsr::covrob_ogk(PC[ind_eur, ])` and `log_dist <- log(mahalanobis(PC, center = cov$center, cov = cov$cov))` for this purpose.
+
+##### Q15: Try to work out how to implement this filtering and plot again. (possibly difficult)
+
